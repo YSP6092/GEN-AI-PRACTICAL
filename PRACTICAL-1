@@ -1,0 +1,23 @@
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import OneHotEncoder
+
+feedback = [
+    "good product",
+    "excellent service",
+    "good service",
+    "bad product"
+]
+
+words = sorted(set(" ".join(feedback).split()))
+encoder = OneHotEncoder(sparse_output=False)
+one_hot = encoder.fit_transform(np.array(words).reshape(-1, 1))
+print("One-Hot Encoding:")
+print(one_hot)
+
+vectorizer = CountVectorizer()
+bow = vectorizer.fit_transform(feedback)
+print("\nBag of Words Vocabulary:")
+print(vectorizer.get_feature_names_out())
+print("\nBag of Words Representation:")
+print(bow.toarray())
