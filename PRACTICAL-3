@@ -1,0 +1,93 @@
+#STEP 1 UPLOAD THE FILE IN GOOGLE COLLAB
+from google.colab import files
+uploaded = files.upload()
+#STEP2-LOAD THE DATASET
+with open("New Text Document.txt", "r", encoding="utf-8") as f:
+    corpus = f.read().splitlines()
+
+print("Number of sentences:", len(corpus))
+print(corpus[:5])  # preview
+
+#STEP3:DATA PREPROCESSING
+import re
+
+processed_corpus = []
+for line in corpus:
+    line = line.lower()
+    line = re.sub(r"[^a-zA-Z0-9\s]", "", line)
+    if line.strip():
+        processed_corpus.append(line)
+
+print("Cleaned sentences:", processed_corpus[:5])
+
+#STEP4-TOKENIZATION
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import tensorflow as tf
+
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(processed_corpus)
+total_words = len(tokenizer.word_index) + 1
+
+input_sequences = []
+for line in processed_corpus:
+    token_list = tokenizer.texts_to_sequences([line])[0]
+    for i in range(1, len(token_list)):
+        n_gram_sequence = token_list[:i+1]
+        input_sequences.append(n_gram_sequence)
+
+max_seq_len = max([len(x) for x in input_sequences])
+input_sequences = pad_sequences(input_sequences, maxlen=max_seq_len, padding='pre')
+
+X = input_sequences[:, :-1]
+y = input_sequences[:, -1]
+y = tf.keras.utils.to_categorical(y, num_classes=total_words)
+#STEP5= BUILD LSTM MODEL
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, LSTM, Dropout, Dense
+
+model = Sequential()
+model.add(Embedding(total_words, 128, input_length=max_seq_len-1))
+model.add(LSTM(256, return_sequences=True))
+model.add(Dropout(0.3))
+model.add(LSTM(128))
+model.add(Dropout(0.3))
+model.add(Dense(total_words, activation='softmax'))
+
+model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+print(model.summary())
+
+#TRAIN THE MODEL
+history = model.fit(X, y, epochs=100, batch_size=32, verbose=1)
+
+# Interactive keyboard-like prediction
+def interactive_keyboard():
+    print("Type a word (or 'quit' to exit):")
+    while True:
+        seed_text = input("You: ")
+        if seed_text.lower() == "quit":
+            print("Exiting keyboard simulation.")
+            break
+        suggestions = suggest_next_word(seed_text, top_k=3)
+        print("Keyboard suggestions:", " | ".join(suggestions))
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import numpy as np
+# Predict classes for X
+y_pred_probs = model.predict(X, verbose=0)
+y_pred = np.argmax(y_pred_probs, axis=1)
+
+# True labels
+y_true = np.argmax(y, axis=1)
+# Accuracy
+acc = accuracy_score(y_true, y_pred)
+
+# Precision, Recall, F1 (macro average for multi-class)
+prec = precision_score(y_true, y_pred, average='macro')
+rec = recall_score(y_true, y_pred, average='macro')
+f1 = f1_score(y_true, y_pred, average='macro')
+
+print("Accuracy:", acc)
+print("Precision:", prec)
+print("Recall:", rec)
+print("F1 Score:", f1)
