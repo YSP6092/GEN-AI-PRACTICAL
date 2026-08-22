@@ -1,0 +1,81 @@
+import pandas as pd
+import numpy as np
+import re
+import html
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, Dense, Flatten
+
+
+# LOADNG OF DRUG REVIEW DATASET
+df = pd.read_csv("drugsComTest_raw.csv")
+
+df_clean = df.loc[:, ['drugName', 'condition', 'review', 'rating']]
+df_clean.loc[:, 'condition'] = df_clean['condition'].fillna("Unknown")
+df_clean = df_clean.dropna(subset=['review'])
+
+df_clean.loc[:, 'sentiment'] = (df_clean['rating'] >= 6).astype(int)
+
+#PREPROCESSING AND CLEANING OF DATA
+def clean_text(text):
+    text = html.unescape(text)
+    text = text.lower()
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text
+
+df_clean.loc[:, 'clean_review'] = df_clean['review'].apply(clean_text)
+print(df_clean[['clean_review','rating','sentiment']].head(10))
+
+#TOKENIZATION AND PADDING
+tokenizer = Tokenizer(num_words=10000, oov_token="<OOV>")
+tokenizer.fit_on_texts(df_clean['clean_review'])
+
+X = tokenizer.texts_to_sequences(df_clean['clean_review'])
+X = pad_sequences(X, maxlen=200, padding='post', truncating='post')
+
+y = df_clean['sentiment'].values
+
+#TRAIN TEST/SPLIT DATA
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ANN MODEL
+model = Sequential()
+model.add(Embedding(input_dim=10000, output_dim=64, input_length=200))
+model.add(Flatten())
+model.add(Dense(128, activation='relu'))
+model.add(Dense(1, activation='sigmoid'))
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+#TRAINING OF MODEL
+history = model.fit(
+    X_train, y_train,
+    epochs=5,
+    batch_size=32,
+    validation_data=(X_test, y_test)
+)
+
+#EVALUATION
+loss, accuracy = model.evaluate(X_test, y_test)
+print("Test Accuracy:", accuracy)
+
+# CLASSIFICATION REPORT
+y_pred = (model.predict(X_test) > 0.5).astype("int32")
+cm = confusion_matrix(y_test, y_pred)
+print("Confusion Matrix:\n", cm)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Negative", "Positive"],
+            yticklabels=["Negative", "Positive"])
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
+
+
+print("Classification Report:\n", classification_report(y_test, y_pred))
