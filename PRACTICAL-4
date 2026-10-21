@@ -1,0 +1,136 @@
+!pip -q install pandas scikit-learn tensorflow
+
+import re
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from google.colab import files
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import Input, Embedding, LSTM, Dense
+from tensorflow.keras.models import Model
+
+# Upload CSV containing columns: english, hindi
+uploaded = files.upload()
+file_name = next(iter(uploaded))
+df = pd.read_csv(file_name)[["english", "hindi"]].dropna()
+
+def clean_english(text):
+    text = str(text).lower().strip()
+    text = re.sub(r"[^a-zA-Z0-9?.!,']", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+def clean_hindi(text):
+    text = str(text).strip()
+    text = re.sub(r"[^\u0900-\u097F0-9?.!,]", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+df["english"] = df["english"].apply(clean_english)
+df["hindi"] = df["hindi"].apply(clean_hindi)
+df["hindi_input"] = "<start> " + df["hindi"]
+df["hindi_target"] = df["hindi"] + " <end>"
+
+# Convert sentences into token ID sequences
+eng_tokenizer = Tokenizer(filters="")
+hin_tokenizer = Tokenizer(filters="")
+eng_tokenizer.fit_on_texts(df["english"])
+hin_tokenizer.fit_on_texts(df["hindi_input"].tolist() + df["hindi_target"].tolist())
+
+encoder_seq = eng_tokenizer.texts_to_sequences(df["english"])
+decoder_input_seq = hin_tokenizer.texts_to_sequences(df["hindi_input"])
+decoder_target_seq = hin_tokenizer.texts_to_sequences(df["hindi_target"])
+
+max_encoder_len = max(map(len, encoder_seq))
+max_decoder_len = max(map(len, decoder_target_seq))
+
+encoder_input = pad_sequences(encoder_seq, maxlen=max_encoder_len, padding="post")
+decoder_input = pad_sequences(decoder_input_seq, maxlen=max_decoder_len, padding="post")
+decoder_target = pad_sequences(decoder_target_seq, maxlen=max_decoder_len, padding="post")
+
+eng_vocab_size = len(eng_tokenizer.word_index) + 1
+hin_vocab_size = len(hin_tokenizer.word_index) + 1
+
+# Split data into training and validation sets
+indices = np.arange(len(df))
+train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
+
+# Build Encoder–Decoder model
+embedding_dim = 128
+lstm_units = 256
+
+encoder_inputs = Input(shape=(None,))
+encoder_embedding = Embedding(eng_vocab_size, embedding_dim, mask_zero=True)(encoder_inputs)
+_, state_h, state_c = LSTM(lstm_units, return_state=True)(encoder_embedding)
+encoder_states = [state_h, state_c]
+
+decoder_inputs = Input(shape=(None,))
+decoder_embedding_layer = Embedding(hin_vocab_size, embedding_dim, mask_zero=True)
+decoder_embedding = decoder_embedding_layer(decoder_inputs)
+decoder_lstm = LSTM(lstm_units, return_sequences=True, return_state=True)
+decoder_outputs, _, _ = decoder_lstm(decoder_embedding, initial_state=encoder_states)
+output_layer = Dense(hin_vocab_size, activation="softmax")
+decoder_outputs = output_layer(decoder_outputs)
+
+model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
+model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+
+# Train
+model.fit(
+    [encoder_input[train_idx], decoder_input[train_idx]],
+    decoder_target[train_idx][..., np.newaxis],
+    validation_data=(
+        [encoder_input[val_idx], decoder_input[val_idx]],
+        decoder_target[val_idx][..., np.newaxis]
+    ),
+    batch_size=64,
+    epochs=30
+)
+
+# Set up inference models for translating new sentences
+encoder_model = Model(encoder_inputs, encoder_states)
+
+state_h_input = Input(shape=(lstm_units,))
+state_c_input = Input(shape=(lstm_units,))
+token_input = Input(shape=(1,))
+token_embedding = decoder_embedding_layer(token_input)
+token_output, next_h, next_c = decoder_lstm(
+    token_embedding, initial_state=[state_h_input, state_c_input]
+)
+token_output = output_layer(token_output)
+
+decoder_model = Model(
+    [token_input, state_h_input, state_c_input],
+    [token_output, next_h, next_c]
+)
+
+hin_word_index = hin_tokenizer.word_index
+index_to_hindi = {i: w for w, i in hin_word_index.items()}
+start_id = hin_word_index["<start>"]
+end_id = hin_word_index["<end>"]
+
+def translate(sentence):
+    sentence = clean_english(sentence)
+    seq = eng_tokenizer.texts_to_sequences([sentence])
+    seq = pad_sequences(seq, maxlen=max_encoder_len, padding="post")
+    states = encoder_model.predict(seq, verbose=0)
+
+    token = np.array([[start_id]])
+    words = []
+
+    for _ in range(max_decoder_len):
+        output, h, c = decoder_model.predict([token] + states, verbose=0)
+        predicted_id = int(np.argmax(output[0, -1, :]))
+        if predicted_id in (0, end_id):
+            break
+        word = index_to_hindi.get(predicted_id)
+        if word and word != "<start>":
+            words.append(word)
+        token = np.array([[predicted_id]])
+        states = [h, c]
+
+    return " ".join(words)
+
+print("\nExample translation:")
+print("English: How are you?")
+print("Hindi:", translate("How are you?"))
