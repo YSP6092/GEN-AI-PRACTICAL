@@ -1,0 +1,506 @@
+# ==============================================================================
+#  GENERATIVE AI WRITING CHATBOT  (Emails • Reports • Technical Explanations)
+#  LLM        : Qwen2.5-Instruct (open-source, no API key needed)
+#  Techniques : Role prompting, structured output, constraints, few-shot,
+#               prompt chaining (plan -> draft), self-refine, parameter control
+#  Includes   : (1) automatic demo with scorecard  (2) full Gradio web app
+# ==============================================================================
+!pip install -q accelerate "gradio>=5,<6"
+
+import re, time, threading, textwrap, torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from IPython.display import display, Markdown
+import gradio as gr
+
+RUN_DEMO = True      # set False to skip the printed demo and go straight to the UI
+
+# ------------------------------------------------------------------------------
+# 1. LOAD THE PRE-TRAINED LLM
+# ------------------------------------------------------------------------------
+HAS_GPU = torch.cuda.is_available()
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct" if HAS_GPU else "Qwen/Qwen2.5-1.5B-Instruct"
+print(f"GPU available: {HAS_GPU} | Loading {MODEL_NAME} (first time takes a few minutes)...")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if HAS_GPU else torch.float32,
+    device_map="auto" if HAS_GPU else None,
+)
+model.eval()
+print("Model ready ✅")
+
+def llm_stream(messages, max_new_tokens=512, temperature=0.7, top_p=0.9, repetition_penalty=1.05):
+    """Streams the growing response text for a list of chat messages."""
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    kw = dict(**inputs, streamer=streamer, max_new_tokens=max_new_tokens,
+              repetition_penalty=repetition_penalty, pad_token_id=tokenizer.eos_token_id)
+    if temperature > 0:
+        kw.update(do_sample=True, temperature=temperature, top_p=top_p)
+    else:
+        kw.update(do_sample=False)
+
+    def worker():
+        try:
+            model.generate(**kw)
+        except Exception as e:
+            streamer.on_finalized_text(f"\n[Generation error: {e}]", stream_end=True)
+
+    th = threading.Thread(target=worker); th.start()
+    out = ""
+    for piece in streamer:
+        out += piece
+        yield out
+    th.join()
+
+def llm(messages, **kw):
+    out = ""
+    for out in llm_stream(messages, **kw):
+        pass
+    return out.strip()
+
+# ------------------------------------------------------------------------------
+# 2. PROMPT-ENGINEERING LIBRARY
+# ------------------------------------------------------------------------------
+TONES = {
+    "Formal":     "formal, respectful and precise; no slang; avoid contractions",
+    "Friendly":   "warm, approachable and conversational but still professional",
+    "Persuasive": "confident and convincing; highlight benefits; clear call to action",
+    "Apologetic": "sincere and accountable; acknowledge the issue; offer a remedy",
+    "Assertive":  "direct and firm but polite; state expectations clearly",
+    "Concise":    "brief and to the point; no filler words",
+    "Empathetic": "understanding and supportive; acknowledge feelings first",
+}
+EMAIL_LEN  = {"Short": "about 80 words", "Medium": "about 150 words", "Long": "about 250 words"}
+REPORT_LEN = {"Short": "about 250 words", "Medium": "about 500 words", "Long": "about 800 words"}
+TECH_LEN   = {"Short": "about 200 words", "Medium": "about 400 words", "Long": "about 650 words"}
+AUDIENCES  = {
+    "Beginner (ELI5)":       "no prior knowledge; use simple words and everyday analogies",
+    "High-school student":   "basic science/maths background; avoid heavy jargon",
+    "Undergraduate student": "knows fundamentals; can handle some technical terms",
+    "Working professional":  "experienced; be precise, practical and concise",
+}
+
+# ---- Role prompting + format constraints + negative constraints (system prompts) ----
+EMAIL_SYSTEM = """You are an expert business-communication writer with 15 years of experience.
+Follow these rules strictly:
+1. Output ONLY the email in this exact format: a 'Subject: ...' line, a blank line, greeting, body, closing, signature.
+2. State the purpose in the first sentence. Use one idea per paragraph.
+3. Match the requested tone and length.
+4. Never invent facts, names, dates or numbers that were not provided; use [placeholders in square brackets] for missing details.
+5. No commentary, no markdown headings, no text before or after the email."""
+
+REPORT_SYSTEM = """You are a senior analyst and professional report writer. Write in Markdown.
+Follow these rules strictly:
+1. Use exactly this structure: '# Title', '## Executive Summary', '## Background', '## Key Findings' (bullets), '## Analysis', '## Recommendations' (numbered list), '## Conclusion'.
+2. Be specific and concrete. Prefer short paragraphs and bullets. Match the audience and tone.
+3. Do not fabricate statistics. If a number is not provided, describe it qualitatively or write [data needed].
+4. Output only the report, with no text before or after it."""
+
+TECH_SYSTEM = """You are a patient senior engineer and teacher who explains complex technical topics clearly.
+Follow these rules strictly:
+1. Adapt vocabulary and depth to the stated audience.
+2. Use this Markdown structure: '## Overview' (2-3 sentences), '## Analogy', '## How It Works' (numbered steps), '## Example' (code or a worked example), '## Common Pitfalls', '## Key Takeaways'.
+3. Define jargon the first time it appears. Be accurate; if unsure, say so rather than guessing.
+4. Output only the explanation, with no text before or after it."""
+
+GENERAL_SYSTEM = ("You are a helpful, accurate and friendly AI assistant. Answer clearly, use Markdown when it helps, "
+                  "and ask a clarifying question if the request is ambiguous.")
+
+PLAN_SYSTEM = ("You are a careful planner. Given a writing request, produce a brief plan as 4-7 short bullet points: "
+               "the goal, the audience, the key points to cover in order, and constraints to respect (such as not inventing facts). "
+               "Output only the bullet list.")
+
+REFINE_SYSTEM = ("You are a meticulous senior editor. You improve drafts so they satisfy a checklist, fixing every issue "
+                 "while keeping the original meaning and format. Output ONLY the improved final text.")
+
+CHECKLISTS = {
+    "email": "- First line is 'Subject: ...'\n- Tone and length match the request\n- No invented facts; missing details are [placeholders]\n- Clear purpose in the first sentence and a clear call to action\n- Professional closing with the sender's name\n- No commentary outside the email",
+    "report": "- Has all sections: Title, Executive Summary, Background, Key Findings, Analysis, Recommendations, Conclusion\n- Specific and concrete; no fabricated statistics\n- Matches audience and length\n- No commentary outside the report",
+    "technical": "- Has all sections: Overview, Analogy, How It Works, Example, Common Pitfalls, Key Takeaways\n- Technically accurate and suited to the audience level\n- Jargon is defined\n- No commentary outside the explanation",
+}
+
+# ---- User-prompt builders (turn form fields into a structured prompt) ----
+def build_email_prompt(f):
+    return (f"Write an email using the details below.\n\n"
+            f"Purpose / context: {f['context']}\n"
+            f"Recipient: {f['recipient']}\n"
+            f"Sender name: {f['sender'] or '[Your Name]'}\n"
+            f"Tone: {f['tone']} ({TONES[f['tone']]})\n"
+            f"Length: {f['length']} ({EMAIL_LEN[f['length']]})")
+
+def build_report_prompt(f):
+    return (f"Write a report using the details below.\n\n"
+            f"Topic: {f['topic']}\n"
+            f"Report type: {f['report_type']}\n"
+            f"Audience: {f['audience']}\n"
+            f"Key points / data to include: {f['key_points'] or 'None provided - keep it general and do not fabricate numbers'}\n"
+            f"Tone: {f['tone']} ({TONES[f['tone']]})\n"
+            f"Length: {f['length']} ({REPORT_LEN[f['length']]})")
+
+def build_tech_prompt(f):
+    return (f"Explain the following technical topic.\n\n"
+            f"Topic: {f['topic']}\n"
+            f"Audience: {f['audience']} ({AUDIENCES[f['audience']]})\n"
+            f"Length: {f['length']} ({TECH_LEN[f['length']]})\n"
+            f"Include a short Python code example: {'yes' if f['code'] else 'no'}")
+
+# ---- Few-shot examples (one worked example per task) ----
+EMAIL_EX_FIELDS = dict(
+    context="Ask my manager for approval to attend a 2-day Python workshop next month. The company covers the fee if approved.",
+    recipient="My manager, Ms. Rao", sender="Arjun", tone="Formal", length="Short")
+EMAIL_EX_OUT = """Subject: Request for Approval - Python Workshop Attendance
+
+Dear Ms. Rao,
+
+I would like to request your approval to attend a two-day Python workshop scheduled for next month. I believe the training will help me contribute more effectively to our projects, and I will make sure my current tasks are covered during my absence.
+
+I understand the company covers the registration fee for approved training. Could you please confirm whether I may proceed with the registration?
+
+Thank you for your consideration.
+
+Kind regards,
+Arjun"""
+
+REPORT_EX_FIELDS = dict(
+    topic="Impact of remote work on team productivity", report_type="Business report", audience="Senior management",
+    key_points="Survey of 120 employees; 70% report fewer interruptions; collaboration is harder; onboarding of new joiners is slower",
+    tone="Formal", length="Short")
+REPORT_EX_OUT = """# Impact of Remote Work on Team Productivity
+
+## Executive Summary
+Remote work has improved individual focus but created challenges for collaboration and onboarding. A hybrid model with clear collaboration norms is recommended.
+
+## Background
+The organisation surveyed 120 employees to understand how remote work affects day-to-day productivity.
+
+## Key Findings
+- 70% of respondents report fewer interruptions when working remotely.
+- Collaboration across teams is reported to be harder.
+- Onboarding of new joiners is slower than in the office.
+
+## Analysis
+Fewer interruptions support deep, focused work, which benefits individual tasks. However, spontaneous communication has declined, which slows joint problem-solving and the transfer of knowledge to new employees.
+
+## Recommendations
+1. Adopt a hybrid schedule with fixed in-office collaboration days.
+2. Create a structured onboarding programme with assigned mentors.
+3. Introduce shared tools and norms for asynchronous communication.
+
+## Conclusion
+Remote work is beneficial for focused work but needs deliberate support for teamwork and onboarding to sustain productivity."""
+
+TECH_EX_FIELDS = dict(topic="What is an API?", audience="Beginner (ELI5)", length="Short", code=False)
+TECH_EX_OUT = """## Overview
+An API (Application Programming Interface) is a set of rules that lets one piece of software ask another piece of software to do something or share data.
+
+## Analogy
+Think of a restaurant. You (the app) do not walk into the kitchen; you give your order to a waiter (the API), who brings it to the kitchen (the server) and returns with your food (the data).
+
+## How It Works
+1. Your app sends a request, for example "give me today's weather".
+2. The API receives the request and checks that it is valid.
+3. The server does the work and prepares the answer.
+4. The API sends the response back to your app.
+
+## Example
+A weather app on your phone asks a weather service's API for the temperature in your city and displays the result.
+
+## Common Pitfalls
+- Sending requests in the wrong format.
+- Forgetting the required key or login.
+
+## Key Takeaways
+An API is a messenger that lets programs talk to each other safely and in a predictable way."""
+
+TASKS = {
+    "email":     dict(system=EMAIL_SYSTEM,  builder=build_email_prompt,  max_tokens=500,
+                      example=(EMAIL_EX_FIELDS, EMAIL_EX_OUT)),
+    "report":    dict(system=REPORT_SYSTEM, builder=build_report_prompt, max_tokens=1200,
+                      example=(REPORT_EX_FIELDS, REPORT_EX_OUT)),
+    "technical": dict(system=TECH_SYSTEM,   builder=build_tech_prompt,   max_tokens=1000,
+                      example=(TECH_EX_FIELDS, TECH_EX_OUT)),
+}
+
+def fewshot_messages(task):
+    fields, out = TASKS[task]["example"]
+    return [{"role": "user", "content": TASKS[task]["builder"](fields)},
+            {"role": "assistant", "content": out}]
+
+# ------------------------------------------------------------------------------
+# 3. THE GENERATION PIPELINE (few-shot + prompt chaining + self-refine)
+# ------------------------------------------------------------------------------
+def run_task(task, fields, few_shot=True, use_plan=False, refine=False, temperature=0.6):
+    """Generator -> yields (status, text, prompt_log) so the UI can stream progress."""
+    cfg = TASKS[task]
+    user_prompt = cfg["builder"](fields)
+    log = f"########## SYSTEM PROMPT (role + rules + format) ##########\n{cfg['system']}\n\n"
+
+    plan_text = ""
+    if use_plan:                                   # STAGE 1: planning (prompt chaining)
+        yield "🧭 Step 1: planning the structure...", "", log
+        plan_text = llm([{"role": "system", "content": PLAN_SYSTEM},
+                         {"role": "user", "content": f"Writing request:\n{user_prompt}"}],
+                        max_new_tokens=220, temperature=0.3)
+        log += f"########## STAGE 1 - PLAN (prompt chaining) ##########\n{plan_text}\n\n"
+
+    final_user = user_prompt + (f"\n\nFollow this plan while writing:\n{plan_text}" if plan_text else "")
+    msgs = [{"role": "system", "content": cfg["system"]}]
+    if few_shot:                                   # FEW-SHOT: worked example before the real request
+        msgs += fewshot_messages(task)
+        log += "########## FEW-SHOT ##########\n1 worked example (user request -> ideal answer) is inserted before your request.\n\n"
+    msgs.append({"role": "user", "content": final_user})
+    log += f"########## USER PROMPT ##########\n{final_user}\n\n"
+
+    draft = ""
+    for draft in llm_stream(msgs, max_new_tokens=cfg["max_tokens"], temperature=temperature):
+        yield "✍️ Writing...", draft, log
+    draft = draft.strip()
+
+    if refine:                                     # STAGE 3: self-review (self-refine)
+        yield "🔎 Reviewing the draft against a checklist...", draft, log
+        refine_user = (f"Original request:\n{user_prompt}\n\nDraft:\n{draft}\n\n"
+                       f"Checklist:\n{CHECKLISTS[task]}\n\n"
+                       f"Fix any issue and output ONLY the improved final text in the same format.")
+        log += f"########## STAGE 3 - SELF-REFINE CHECKLIST ##########\n{CHECKLISTS[task]}\n\n"
+        final = draft
+        for final in llm_stream([{"role": "system", "content": REFINE_SYSTEM},
+                                 {"role": "user", "content": refine_user}],
+                                max_new_tokens=cfg["max_tokens"], temperature=0.3):
+            yield "✨ Polishing...", final, log
+        draft = final.strip()
+
+    yield "✅ Done", draft, log
+
+def generate_text(task, fields, **kw):
+    text = log = ""
+    for _, text, log in run_task(task, fields, **kw):
+        pass
+    return text, log
+
+# ------------------------------------------------------------------------------
+# 4. AUTOMATIC DEMO (prints results in the notebook)
+# ------------------------------------------------------------------------------
+def banner(t):
+    print("\n" + "=" * 90 + f"\n{t}\n" + "=" * 90)
+
+def scorecard(title, checks):
+    print(f"\n  📋 {title}")
+    for k, v in checks.items():
+        print(f"     {'✅' if v else '❌'} {k}")
+    print(f"     → {sum(checks.values())}/{len(checks)} checks passed")
+
+def check_email(t, sender):
+    wc = len(t.split())
+    return {"Starts with 'Subject:' line": t.strip().lower().startswith("subject:"),
+            "Has a greeting": bool(re.search(r"\b(dear|hi|hello)\b", t, re.I)),
+            "Signed with sender name": sender.lower() in t.lower(),
+            "Length 90-220 words (target ~150)": 90 <= wc <= 220,
+            "No chatty preamble (e.g. 'Sure!', 'Here is')": not re.match(r"\s*(sure|certainly|here is|here's|of course)", t, re.I)}
+
+def check_sections(t, sections):
+    return {f"Section '{s}'": s.lower() in t.lower() for s in sections}
+
+if RUN_DEMO:
+    banner("DEMO 1 - EMAIL: naive prompt vs. engineered prompt")
+    naive = "Write an email to my manager asking for 2 days leave next week for a family function."
+    t0 = time.time()
+    naive_out = llm([{"role": "user", "content": naive}], max_new_tokens=350, temperature=0.6)
+    print(f"\n🔹 NAIVE PROMPT: \"{naive}\"\n")
+    print(naive_out)
+    scorecard("Naive prompt scorecard", check_email(naive_out, "Priya"))
+
+    email_fields = dict(context="Request 2 days of leave (next Thursday and Friday) for a family function. "
+                                "I will finish my pending report before leaving and my colleague Rahul can cover urgent tasks.",
+                        recipient="My manager, Mr. Verma", sender="Priya", tone="Formal", length="Medium")
+    eng_out, eng_log = generate_text("email", email_fields, few_shot=True, use_plan=True, refine=True)
+    print("\n\n🔸 ENGINEERED (role + rules + few-shot + plan + self-refine):\n")
+    print(eng_out)
+    scorecard("Engineered prompt scorecard", check_email(eng_out, "Priya"))
+    print("\n🔍 What the LLM was actually given (prompt log):\n")
+    print(textwrap.indent(eng_log, "   "))
+    print(f"⏱️ Demo 1 time: {time.time() - t0:.0f}s")
+
+    banner("DEMO 2 - REPORT GENERATION")
+    t0 = time.time()
+    report_fields = dict(topic="Adopting AI chatbots for student support in a university",
+                         report_type="Project status report", audience="University administration",
+                         key_points="Pilot ran for 6 weeks; chatbot handled common FAQs on admissions and exams; "
+                                    "staff workload on repetitive queries reduced; some answers needed human review; data privacy is a concern",
+                         tone="Formal", length="Medium")
+    rep_out, _ = generate_text("report", report_fields, few_shot=True, use_plan=False, refine=False)
+    display(Markdown(rep_out))
+    scorecard("Report structure check", check_sections(
+        rep_out, ["Executive Summary", "Background", "Key Findings", "Analysis", "Recommendations", "Conclusion"]))
+    print(f"⏱️ Demo 2 time: {time.time() - t0:.0f}s")
+
+    banner("DEMO 3 - TECHNICAL EXPLANATION")
+    t0 = time.time()
+    tech_fields = dict(topic="How does a neural network learn using backpropagation?",
+                       audience="Undergraduate student", length="Medium", code=True)
+    tech_out, _ = generate_text("technical", tech_fields, few_shot=True)
+    display(Markdown(tech_out))
+    scorecard("Technical explanation structure check", check_sections(
+        tech_out, ["Overview", "Analogy", "How It Works", "Example", "Common Pitfalls", "Key Takeaways"]))
+    print(f"⏱️ Demo 3 time: {time.time() - t0:.0f}s")
+
+    print("\n✅ Demo complete. Launching the interactive web app below...\n")
+
+# ------------------------------------------------------------------------------
+# 5. GRADIO WEB APP
+# ------------------------------------------------------------------------------
+MODES = {"General Assistant": (GENERAL_SYSTEM, None),
+         "Email Writer": (EMAIL_SYSTEM, "email"),
+         "Report Writer": (REPORT_SYSTEM, "report"),
+         "Technical Explainer": (TECH_SYSTEM, "technical")}
+
+def chat_fn(message, history, mode, temperature, use_few_shot):
+    history = history or []
+    if not message or not message.strip():
+        yield history, ""
+        return
+    system, task = MODES[mode]
+    msgs = [{"role": "system", "content": system}]
+    if use_few_shot and task:
+        msgs += fewshot_messages(task)
+    msgs += [{"role": m["role"], "content": m["content"]} for m in history[-8:]]
+    msgs.append({"role": "user", "content": message})
+    history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+    for partial in llm_stream(msgs, max_new_tokens=800, temperature=temperature):
+        history[-1]["content"] = partial
+        yield history, ""
+
+TECHNIQUES = ["Few-shot examples", "Plan first (prompt chaining)", "Self-review & refine"]
+def opts_to_kw(opts, temp):
+    return dict(few_shot=TECHNIQUES[0] in opts, use_plan=TECHNIQUES[1] in opts,
+                refine=TECHNIQUES[2] in opts, temperature=temp)
+
+def ui_email(ctx, rec, snd, tone, length, opts, temp):
+    if not ctx.strip():
+        yield "⚠️ Please describe what the email should say.", "", ""; return
+    f = dict(context=ctx, recipient=rec or "the recipient", sender=snd, tone=tone, length=length)
+    yield from run_task("email", f, **opts_to_kw(opts, temp))
+
+def ui_report(topic, rtype, aud, pts, tone, length, opts, temp):
+    if not topic.strip():
+        yield "⚠️ Please enter a topic.", "", ""; return
+    f = dict(topic=topic, report_type=rtype, audience=aud or "General readers", key_points=pts, tone=tone, length=length)
+    yield from run_task("report", f, **opts_to_kw(opts, temp))
+
+def ui_tech(topic, aud, length, code, opts, temp):
+    if not topic.strip():
+        yield "⚠️ Please enter a topic.", "", ""; return
+    f = dict(topic=topic, audience=aud, length=length, code=code)
+    yield from run_task("technical", f, **opts_to_kw(opts, temp))
+
+with gr.Blocks(title="GenAI Writing Assistant", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# ✍️ Generative AI Writing Assistant\n"
+                f"Generate **emails, reports and technical explanations** with `{MODEL_NAME}` and prompt-engineering techniques.")
+
+    # ---------------- Chat tab ----------------
+    with gr.Tab("💬 Chatbot"):
+        with gr.Row():
+            mode = gr.Dropdown(list(MODES), value="General Assistant", label="Assistant mode (changes the system prompt)")
+            c_temp = gr.Slider(0.0, 1.2, value=0.7, step=0.05, label="Creativity (temperature)")
+            c_fs = gr.Checkbox(value=True, label="Use few-shot example")
+        chatbot = gr.Chatbot(type="messages", height=430, show_copy_button=True, label="Conversation")
+        msg = gr.Textbox(label="Your message", placeholder="e.g. Write an email to my professor requesting an extension...", lines=2)
+        with gr.Row():
+            send = gr.Button("Send", variant="primary")
+            clear = gr.Button("Clear")
+        gr.Examples(examples=[
+            "Write a polite email to my professor requesting a 3-day extension for my assignment.",
+            "Write a short report on the benefits and risks of using AI in healthcare.",
+            "Explain how HTTPS works to a beginner.",
+            "What is the difference between a process and a thread?"], inputs=msg, cache_examples=False)
+        send.click(chat_fn, [msg, chatbot, mode, c_temp, c_fs], [chatbot, msg])
+        msg.submit(chat_fn, [msg, chatbot, mode, c_temp, c_fs], [chatbot, msg])
+        clear.click(lambda: ([], ""), None, [chatbot, msg])
+
+    # ---------------- Email tab ----------------
+    with gr.Tab("✉️ Email Generator"):
+        with gr.Row():
+            with gr.Column():
+                e_ctx = gr.Textbox(label="What should the email say? (purpose / context)", lines=4,
+                                   placeholder="e.g. Follow up on my job application sent last week for the Data Analyst role.")
+                e_rec = gr.Textbox(label="Recipient", placeholder="e.g. HR Manager, Ms. Sharma")
+                e_snd = gr.Textbox(label="Your name", placeholder="e.g. Rohan")
+                e_tone = gr.Dropdown(list(TONES), value="Formal", label="Tone")
+                e_len = gr.Radio(["Short", "Medium", "Long"], value="Short", label="Length")
+                e_opts = gr.CheckboxGroup(TECHNIQUES, value=[TECHNIQUES[0]], label="Prompt-engineering techniques")
+                e_temp = gr.Slider(0.0, 1.2, value=0.6, step=0.05, label="Creativity (temperature)")
+                e_btn = gr.Button("Generate Email", variant="primary")
+            with gr.Column():
+                e_status = gr.Markdown()
+                e_out = gr.Textbox(label="Generated email", lines=16, show_copy_button=True)
+                with gr.Accordion("🔍 Engineered prompt (what the LLM saw)", open=False):
+                    e_log = gr.Textbox(lines=14, show_label=False)
+        e_btn.click(ui_email, [e_ctx, e_rec, e_snd, e_tone, e_len, e_opts, e_temp], [e_status, e_out, e_log])
+        gr.Examples(examples=[
+            ["Follow up on my application for the Data Analyst position submitted last week and ask about next steps.", "HR Manager", "Rohan", "Friendly", "Short"],
+            ["Apologise to a client for a 2-day delay in project delivery and propose a new delivery date.", "Mr. Mehta (client)", "Sneha", "Apologetic", "Medium"]],
+            inputs=[e_ctx, e_rec, e_snd, e_tone, e_len], cache_examples=False)
+
+    # ---------------- Report tab ----------------
+    with gr.Tab("📊 Report Generator"):
+        with gr.Row():
+            with gr.Column():
+                r_topic = gr.Textbox(label="Report topic", placeholder="e.g. Cybersecurity risks of using public Wi-Fi")
+                r_type = gr.Dropdown(["Business report", "Technical report", "Project status report", "Research summary",
+                                      "Incident / post-mortem report", "Market analysis"], value="Business report", label="Report type")
+                r_aud = gr.Textbox(label="Audience", value="Senior management")
+                r_pts = gr.Textbox(label="Key points / data to include (optional)", lines=4,
+                                   placeholder="Bullet points, facts or numbers you want in the report")
+                r_tone = gr.Dropdown(["Formal", "Concise", "Persuasive", "Friendly"], value="Formal", label="Tone")
+                r_len = gr.Radio(["Short", "Medium", "Long"], value="Medium", label="Length")
+                r_opts = gr.CheckboxGroup(TECHNIQUES, value=[TECHNIQUES[0]], label="Prompt-engineering techniques")
+                r_temp = gr.Slider(0.0, 1.2, value=0.5, step=0.05, label="Creativity (temperature)")
+                r_btn = gr.Button("Generate Report", variant="primary")
+            with gr.Column():
+                r_status = gr.Markdown()
+                r_out = gr.Textbox(label="Generated report (Markdown)", lines=24, show_copy_button=True)
+                with gr.Accordion("🔍 Engineered prompt (what the LLM saw)", open=False):
+                    r_log = gr.Textbox(lines=14, show_label=False)
+        r_btn.click(ui_report, [r_topic, r_type, r_aud, r_pts, r_tone, r_len, r_opts, r_temp], [r_status, r_out, r_log])
+
+    # ---------------- Technical tab ----------------
+    with gr.Tab("🧠 Technical Explainer"):
+        with gr.Row():
+            with gr.Column():
+                t_topic = gr.Textbox(label="Technical topic", placeholder="e.g. How does DNS work?")
+                t_aud = gr.Dropdown(list(AUDIENCES), value="Undergraduate student", label="Audience level")
+                t_len = gr.Radio(["Short", "Medium", "Long"], value="Medium", label="Length")
+                t_code = gr.Checkbox(value=False, label="Include a Python code example")
+                t_opts = gr.CheckboxGroup(TECHNIQUES, value=[TECHNIQUES[0]], label="Prompt-engineering techniques")
+                t_temp = gr.Slider(0.0, 1.2, value=0.4, step=0.05, label="Creativity (temperature)")
+                t_btn = gr.Button("Explain", variant="primary")
+            with gr.Column():
+                t_status = gr.Markdown()
+                t_out = gr.Textbox(label="Explanation (Markdown)", lines=24, show_copy_button=True)
+                with gr.Accordion("🔍 Engineered prompt (what the LLM saw)", open=False):
+                    t_log = gr.Textbox(lines=14, show_label=False)
+        t_btn.click(ui_tech, [t_topic, t_aud, t_len, t_code, t_opts, t_temp], [t_status, t_out, t_log])
+        gr.Examples(examples=[["How does a hash table work?", "Beginner (ELI5)", "Short", True],
+                              ["What is the CAP theorem?", "Working professional", "Medium", False]],
+                    inputs=[t_topic, t_aud, t_len, t_code], cache_examples=False)
+
+    # ---------------- Techniques tab ----------------
+    with gr.Tab("📘 Techniques Used"):
+        gr.Markdown("""
+| # | Prompt-engineering technique | How it is used in this app |
+|---|---|---|
+| 1 | **Role prompting** | System prompts make the LLM act as an email writer, report analyst or senior engineer-teacher |
+| 2 | **Structured output / format constraints** | Fixed formats: `Subject:` line for emails, 7 sections for reports, 6 sections for explanations |
+| 3 | **Negative constraints** | "Never invent facts", "no text before or after" - reduces hallucination and chatty replies |
+| 4 | **Parameterised prompt templates** | Tone, length, audience and report type are injected into the prompt from form fields |
+| 5 | **Few-shot prompting** | One ideal worked example (request -> answer) is placed before the real request |
+| 6 | **Prompt chaining** | Stage 1 plans the outline, Stage 2 writes the draft using that plan |
+| 7 | **Self-refine (critique and rewrite)** | The draft is checked against a checklist and rewritten by an "editor" prompt |
+| 8 | **Decoding control** | Temperature, top-p, repetition penalty and max tokens tune creativity and length |
+
+**Tip:** open the *Engineered prompt* accordion after generating to see exactly what the model received.
+""")
+
+demo.queue().launch(share=True, debug=False)
