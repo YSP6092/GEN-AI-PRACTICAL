@@ -1,0 +1,288 @@
+# ============================================================
+#  COLLEGE REGULATIONS & FAQ ASSISTANT  (RAG + pre-trained LMs)
+#  Embedder : sentence-transformers/all-MiniLM-L6-v2
+#  Generator: google/flan-t5-large
+#  UI       : Gradio (public link)
+# ============================================================
+!pip install -q sentence-transformers gradio pypdf
+
+import re, torch, numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import gradio as gr
+from pypdf import PdfReader
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Running on:", device)
+
+# ------------------------------------------------------------
+# 1. KNOWLEDGE BASE  (sample college rules - replace/upload your own)
+# ------------------------------------------------------------
+KNOWLEDGE_BASE = """
+## Attendance Policy
+Every student must maintain a minimum of 75% attendance in each course to be eligible to appear in the end-semester examination. Attendance is calculated separately for theory and laboratory components.
+
+## Attendance Condonation
+Students with attendance between 65% and 74% may apply for condonation if they have a valid reason such as illness or a family emergency. A medical certificate or supporting document must be submitted to the Head of Department. A condonation fee of Rs. 500 per course is charged. Students with attendance below 65% are detained and must repeat the course.
+
+## Examination Rules
+Students must carry their college ID card and hall ticket to every examination. Mobile phones, smart watches and any electronic gadgets are strictly prohibited in the examination hall. Students must report 20 minutes before the exam starts and are not allowed to enter after 30 minutes from the start time. Use of unfair means leads to cancellation of the paper and may lead to suspension for one semester.
+
+## Hall Ticket
+Hall tickets are issued two weeks before the end-semester exams through the student portal. Students with pending fees or attendance shortage will not receive a hall ticket.
+
+## Grading System
+The college follows a 10-point grading system. O (Outstanding) = 10, A+ = 9, A = 8, B+ = 7, B = 6, C = 5, P (Pass) = 4 and F (Fail) = 0. A student must score at least 40% marks overall and 35% in the end-semester exam to pass a course.
+
+## CGPA and Minimum Requirement
+CGPA is calculated as the weighted average of grade points across all semesters. A minimum CGPA of 5.0 is required to be awarded the degree. A CGPA of 7.5 and above with no backlogs earns First Class with Distinction.
+
+## Backlogs and Supplementary Exams
+Students who fail a course can appear for the supplementary examination held within one month after the declaration of results. A student can have a maximum of 6 active backlogs to be promoted to the next year. The maximum duration to complete a 4-year B.Tech programme is 7 years.
+
+## Re-evaluation and Revaluation
+Students can apply for re-evaluation within 7 days of result declaration by paying Rs. 1000 per paper. A photocopy of the answer script can be obtained by paying Rs. 500 per paper. The result of re-evaluation is declared within 21 days and is final.
+
+## Tuition Fee Payment
+The tuition fee must be paid in two instalments, at the start of the odd semester and the even semester. The last date is announced in the academic calendar. A late fee of Rs. 100 per day is charged for delay up to 15 days. After 15 days the student may be barred from attending classes. Fees can be paid online through the student portal or at the accounts office between 10 AM and 3 PM on working days.
+
+## Fee Refund
+If a student withdraws from the college before the commencement of classes, 90% of the tuition fee is refunded. After classes begin, only 50% is refunded within the first 30 days. No refund is given after 30 days. Caution deposit is refundable at the end of the programme.
+
+## Scholarships
+Merit scholarships are given to students with a CGPA above 9.0 and a fee waiver of 25% is applicable. Students from families with annual income below Rs. 2.5 lakh can apply for the need-based scholarship. Applications must be submitted to the scholarship cell before 31st August every year with income certificate and mark sheets.
+
+## Hostel Rules
+Hostel is allotted on a first-come, first-served basis to first-year students from outside the city. The hostel gate closes at 9:00 PM for girls and 10:00 PM for boys. Visitors are allowed only in the visitors' room between 4 PM and 6 PM on Sundays. Ragging, alcohol, smoking and electric heaters are strictly prohibited. Hostel fee is Rs. 60,000 per year including mess charges.
+
+## Library Rules
+The library is open from 8:30 AM to 8:00 PM on working days and 9 AM to 1 PM on Saturdays. Undergraduate students can borrow 3 books for 14 days. A fine of Rs. 2 per day per book is charged for late return. Lost books must be replaced or paid for at the current market price. Digital library access is available using the student portal login.
+
+## Anti-Ragging Policy
+Ragging is a criminal offence. Any student found guilty of ragging may be expelled, suspended or booked under law. Students can report incidents to the Anti-Ragging Committee or call the helpline 1800-180-5522 anonymously. Every student and parent must submit an anti-ragging affidavit at admission.
+
+## Leave Rules
+Students must submit a leave application to the class coordinator in advance. For medical leave of more than 3 days, a medical certificate from a registered doctor is mandatory. On-duty leave is granted for college-approved events such as sports and technical competitions and is counted as present for attendance.
+
+## ID Card
+Every student must wear the ID card on campus. A lost ID card must be reported to the administrative office and a duplicate is issued within 3 working days for a fee of Rs. 200.
+
+## Internships and Placements
+Students become eligible for campus placements from the 6th semester if they have no active backlogs and a minimum CGPA of 6.0. Internship of at least 4 weeks is mandatory in the summer after the 6th semester and a report must be submitted to the department.
+
+## Grievance Redressal
+Students can submit complaints to the Grievance Redressal Cell through the grievance box or by email to grievance@college.edu. The cell responds within 7 working days. Unresolved matters can be escalated to the Principal.
+
+## Dress Code and Conduct
+Students must wear formal attire on campus. Wearing the college uniform is mandatory on Mondays and during lab sessions. Use of mobile phones is not allowed inside classrooms and laboratories. Vehicles must be parked only in the designated parking area and a parking sticker is mandatory.
+
+## Bonafide and Transfer Certificates
+A bonafide certificate is issued within 2 working days by applying at the administrative office with a fee of Rs. 50. The transfer certificate is issued after clearing all dues, returning the library books and the ID card, and takes 7 working days.
+
+## Contact and Office Timings
+The administrative office works from 9:30 AM to 4:30 PM, Monday to Saturday. The college helpdesk email is helpdesk@college.edu and the phone number is 0712-555-0100. The examination cell is located on the ground floor of the Administrative Block.
+"""
+
+# ------------------------------------------------------------
+# 2. CHUNKING
+# ------------------------------------------------------------
+def chunk_text(text, max_words=110, overlap=25):
+    text = text.replace("\r", "")
+    chunks = []
+    if "## " in text:  # structured FAQ / regulations
+        for block in re.split(r"\n(?=## )", text.strip()):
+            block = block.strip()
+            if not block:
+                continue
+            title, *body = block.split("\n", 1)
+            title = title.replace("##", "").strip()
+            body = body[0].strip() if body else ""
+            words = body.split()
+            if len(words) <= max_words + 20:
+                chunks.append(f"{title}: {body}")
+            else:
+                step = max_words - overlap
+                for i in range(0, len(words), step):
+                    chunks.append(f"{title}: " + " ".join(words[i:i + max_words]))
+    else:  # plain text from uploaded PDF/TXT
+        words = text.split()
+        step = max_words - overlap
+        for i in range(0, len(words), step):
+            piece = " ".join(words[i:i + max_words])
+            if len(piece.split()) > 15:
+                chunks.append(piece)
+    return chunks
+
+# ------------------------------------------------------------
+# 3. LOAD PRE-TRAINED MODELS
+# ------------------------------------------------------------
+print("Loading embedding model...")
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=device)
+
+MODEL_NAME = "google/flan-t5-large"   # use "google/flan-t5-base" on slow CPU
+print("Loading language model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+llm = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+llm.eval()
+
+def build_index(chunk_list):
+    return embedder.encode(chunk_list, convert_to_numpy=True,
+                           normalize_embeddings=True, show_progress_bar=False)
+
+chunks = chunk_text(KNOWLEDGE_BASE)
+chunk_embeddings = build_index(chunks)
+print(f"Indexed {len(chunks)} chunks.")
+
+# ------------------------------------------------------------
+# 4. RETRIEVAL + ANSWER GENERATION
+# ------------------------------------------------------------
+SIM_THRESHOLD = 0.30   # below this -> "I don't know"
+TOP_K = 3
+FALLBACK = ("Sorry, I couldn't find this in the college regulations. "
+            "Please contact the helpdesk: helpdesk@college.edu / 0712-555-0100.")
+
+def retrieve(question, k=TOP_K):
+    q_emb = embedder.encode([question], convert_to_numpy=True, normalize_embeddings=True)[0]
+    scores = chunk_embeddings @ q_emb
+    top = np.argsort(-scores)[:k]
+    return [(chunks[i], float(scores[i])) for i in top]
+
+def generate_answer(question, k=TOP_K):
+    question = question.strip()
+    if not question:
+        return "Please type a question.", []
+    hits = retrieve(question, k)
+    if hits[0][1] < SIM_THRESHOLD:
+        return FALLBACK, hits
+
+    context = "\n".join(f"- {c}" for c, _ in hits)
+    prompt = (
+        "Answer the student's question using only the context below. "
+        "Be clear and complete, and include specific numbers, dates and amounts when present. "
+        "If the answer is not in the context, say \"I don't know\".\n\n"
+        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    with torch.no_grad():
+        out = llm.generate(**inputs, max_new_tokens=160, num_beams=4,
+                           no_repeat_ngram_size=3, early_stopping=True)
+    answer = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+    if not answer or answer.lower().startswith("i don't know"):
+        answer = "I couldn't find a clear answer in the regulations. Please contact helpdesk@college.edu / 0712-555-0100."
+    return answer, hits
+
+# ------------------------------------------------------------
+# 5. QUICK TEST (prints in the notebook)
+# ------------------------------------------------------------
+test_questions = [
+    "What is the minimum attendance required to write exams?",
+    "What is the late fee for tuition payment?",
+    "Can I get a refund if I withdraw after classes start?",
+    "How many books can I borrow from the library?",
+    "What is the hostel gate closing time for girls?",
+    "How do I apply for re-evaluation and what is the fee?",
+    "Who is the prime minister of France?",   # out-of-scope test
+]
+print("\n" + "=" * 70 + "\nQUICK TEST\n" + "=" * 70)
+for q in test_questions:
+    ans, hits = generate_answer(q)
+    print(f"Q: {q}\nA: {ans}\n   (top match: {hits[0][0].split(':')[0]}, score={hits[0][1]:.2f})\n" + "-" * 70)
+
+# ------------------------------------------------------------
+# 6. SIMPLE RETRIEVAL EVALUATION (for report / viva)
+# ------------------------------------------------------------
+eval_set = [
+    ("What is the minimum attendance required?", "Attendance Policy"),
+    ("How much is the condonation fee?", "Attendance Condonation"),
+    ("Are mobile phones allowed in exam hall?", "Examination Rules"),
+    ("What is the pass mark?", "Grading System"),
+    ("How many active backlogs are allowed?", "Backlogs and Supplementary Exams"),
+    ("What is the fee for photocopy of answer script?", "Re-evaluation and Revaluation"),
+    ("What is the late fee per day?", "Tuition Fee Payment"),
+    ("How much refund do I get on withdrawal?", "Fee Refund"),
+    ("Who can apply for need-based scholarship?", "Scholarships"),
+    ("What are visiting hours in hostel?", "Hostel Rules"),
+    ("What is the fine for late return of books?", "Library Rules"),
+    ("What is the anti-ragging helpline?", "Anti-Ragging Policy"),
+    ("How long does a duplicate ID card take?", "ID Card"),
+    ("What is the CGPA needed for placements?", "Internships and Placements"),
+    ("How do I file a complaint?", "Grievance Redressal"),
+]
+top1 = top3 = 0
+for qn, section in eval_set:
+    titles = [h[0].split(":")[0] for h in retrieve(qn, 3)]
+    top1 += titles[0] == section
+    top3 += section in titles
+print(f"\nTop-1 retrieval accuracy: {top1}/{len(eval_set)} = {top1/len(eval_set):.0%}")
+print(f"Top-3 retrieval accuracy: {top3}/{len(eval_set)} = {top3/len(eval_set):.0%}\n")
+
+# ------------------------------------------------------------
+# 7. GRADIO CHATBOT UI
+# ------------------------------------------------------------
+def read_file(path):
+    if path.lower().endswith(".pdf"):
+        reader = PdfReader(path)
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def ask(question):
+    answer, hits = generate_answer(question)
+    sources = "\n\n".join(f"**Source {i+1}** (similarity {s:.2f}):\n{c}"
+                          for i, (c, s) in enumerate(hits))
+    return answer, sources
+
+def upload_docs(files):
+    global chunks, chunk_embeddings
+    if not files:
+        return "No file selected."
+    text = ""
+    for f in files:
+        path = f if isinstance(f, str) else f.name
+        text += "\n\n" + read_file(path)
+    new_chunks = chunk_text(text)
+    if not new_chunks:
+        return "Could not extract text from the file(s)."
+    chunks = new_chunks
+    chunk_embeddings = build_index(chunks)
+    return f"✅ Knowledge base replaced. Indexed {len(chunks)} chunks. Go to the Ask tab."
+
+def reset_kb():
+    global chunks, chunk_embeddings
+    chunks = chunk_text(KNOWLEDGE_BASE)
+    chunk_embeddings = build_index(chunks)
+    return f"♻️ Reset to the sample knowledge base ({len(chunks)} chunks)."
+
+examples = [
+    "What is the minimum attendance required to write exams?",
+    "What happens if my attendance is 70%?",
+    "What is the late fee for tuition payment?",
+    "How many backlogs are allowed for promotion?",
+    "When does the hostel gate close?",
+    "What is the fine for returning library books late?",
+    "Am I eligible for campus placements?",
+    "How can I get a bonafide certificate?",
+]
+
+with gr.Blocks(title="College FAQ Assistant", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🎓 College Regulations & FAQ Assistant\n"
+                "Ask anything about attendance, exams, fees, hostel, library, scholarships and more.")
+    with gr.Tab("💬 Ask"):
+        q = gr.Textbox(label="Your question",
+                       placeholder="e.g. What is the minimum attendance required?", lines=2)
+        btn = gr.Button("Ask", variant="primary")
+        a = gr.Textbox(label="Answer", lines=5)
+        with gr.Accordion("📚 Retrieved sources (for transparency)", open=False):
+            s = gr.Markdown()
+        gr.Examples(examples=examples, inputs=q)
+        btn.click(ask, q, [a, s])
+        q.submit(ask, q, [a, s])
+    with gr.Tab("📄 Upload Documents"):
+        gr.Markdown("Upload your college rulebook / FAQ (PDF or TXT) to use as the knowledge base.")
+        files = gr.File(file_count="multiple", file_types=[".pdf", ".txt"], label="Upload PDF/TXT")
+        status = gr.Textbox(label="Status")
+        with gr.Row():
+            gr.Button("Build knowledge base", variant="primary").click(upload_docs, files, status)
+            gr.Button("Reset to sample data").click(reset_kb, None, status)
+
+demo.launch(share=True, debug=False)
