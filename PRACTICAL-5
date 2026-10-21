@@ -1,0 +1,285 @@
+# ============================================================
+# TEXT SUMMARIZATION USING A TRANSFORMER (T5)
+# Run this entire script in one Google Colab cell.
+# Required CSV columns: text, summary
+# ============================================================
+
+# 1. Install required libraries
+!pip -q install -U transformers datasets accelerate sentencepiece pandas
+
+# 2. Import libraries
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+import torch
+
+from google.colab import files
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    set_seed
+)
+
+# 3. Set a random seed for reproducible results
+SEED = 42
+set_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+print("PyTorch version:", torch.__version__)
+print("GPU available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+# 4. Upload the dataset
+print("\nUpload a CSV file with columns named 'text' and 'summary'.")
+uploaded = files.upload()
+
+if not uploaded:
+    raise ValueError("No file was uploaded.")
+
+file_name = next(iter(uploaded))
+df = pd.read_csv(file_name)
+
+# 5. Check that required columns exist
+required_columns = {"text", "summary"}
+missing_columns = required_columns - set(df.columns)
+
+if missing_columns:
+    raise ValueError(
+        f"Missing columns: {missing_columns}. "
+        "Your CSV must have columns named 'text' and 'summary'."
+    )
+
+# Keep only the required columns and remove empty rows
+df = df[["text", "summary"]].dropna().copy()
+
+# Convert values to strings and clean extra whitespace
+def clean_text(value):
+    value = str(value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+df["text"] = df["text"].apply(clean_text)
+df["summary"] = df["summary"].apply(clean_text)
+
+# Remove rows with empty text or summary
+df = df[(df["text"] != "") & (df["summary"] != "")]
+df = df.drop_duplicates().reset_index(drop=True)
+
+if len(df) < 2:
+    raise ValueError("At least two non-empty text-summary pairs are required.")
+
+print("\nDataset preview:")
+display(df.head())
+print("Number of examples:", len(df))
+
+# 6. Optional limit for a quicker demonstration
+# Increase this number or set it to None to use the full dataset.
+MAX_EXAMPLES = 2000
+
+if MAX_EXAMPLES is not None and len(df) > MAX_EXAMPLES:
+    df = df.sample(n=MAX_EXAMPLES, random_state=SEED).reset_index(drop=True)
+    print(f"Using a random sample of {MAX_EXAMPLES} examples.")
+
+# 7. Split data into training and validation sets
+dataset = Dataset.from_pandas(df, preserve_index=False)
+split_dataset = dataset.train_test_split(test_size=0.1, seed=SEED)
+
+train_dataset = split_dataset["train"]
+validation_dataset = split_dataset["test"]
+
+print("\nTraining examples:", len(train_dataset))
+print("Validation examples:", len(validation_dataset))
+
+# 8. Select a pretrained Transformer model
+# T5-small is relatively lightweight and suitable for a demonstration.
+MODEL_NAME = "google-t5/t5-small"
+
+print("\nLoading tokenizer and model:", MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+
+# 9. Define tokenization and sequence-length settings
+MAX_INPUT_LENGTH = 512
+MAX_TARGET_LENGTH = 128
+
+# T5 uses the "summarize:" task prefix
+def preprocess_function(batch):
+    inputs = ["summarize: " + text for text in batch["text"]]
+
+    model_inputs = tokenizer(
+        inputs,
+        max_length=MAX_INPUT_LENGTH,
+        truncation=True
+    )
+
+    labels = tokenizer(
+        text_target=batch["summary"],
+        max_length=MAX_TARGET_LENGTH,
+        truncation=True
+    )
+
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+# 10. Convert text into model token IDs
+print("\nTokenizing dataset...")
+tokenized_train = train_dataset.map(
+    preprocess_function,
+    batched=True,
+    remove_columns=train_dataset.column_names,
+    desc="Tokenizing training data"
+)
+
+tokenized_validation = validation_dataset.map(
+    preprocess_function,
+    batched=True,
+    remove_columns=validation_dataset.column_names,
+    desc="Tokenizing validation data"
+)
+
+# Dynamically pad each batch
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model
+)
+
+# 11. Configure training
+OUTPUT_DIR = "/content/t5_summarizer_output"
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir=OUTPUT_DIR,
+    learning_rate=2e-4,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=2,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    warmup_ratio=0.05,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    save_total_limit=2,
+    predict_with_generate=True,
+    generation_max_length=MAX_TARGET_LENGTH,
+    logging_steps=25,
+    fp16=torch.cuda.is_available(),
+    report_to="none",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+    seed=SEED
+)
+
+# 12. Create the trainer
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_validation,
+    processing_class=tokenizer,
+    data_collator=data_collator
+)
+
+# 13. Fine-tune the model
+print("\nStarting fine-tuning...")
+train_result = trainer.train()
+
+print("\nTraining completed.")
+print("Training metrics:", train_result.metrics)
+
+# 14. Evaluate on the validation set
+print("\nEvaluating model on validation data...")
+evaluation_results = trainer.evaluate()
+print("Evaluation results:", evaluation_results)
+
+# 15. Define a function to generate summaries
+def summarize(
+    text,
+    max_input_length=MAX_INPUT_LENGTH,
+    max_new_tokens=100,
+    num_beams=4
+):
+    text = clean_text(text)
+
+    inputs = tokenizer(
+        "summarize: " + text,
+        return_tensors="pt",
+        max_length=max_input_length,
+        truncation=True
+    )
+
+    # Send input tensors to the same device as the model
+    inputs = {key: value.to(model.device) for key, value in inputs.items()}
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams,
+            no_repeat_ngram_size=3,
+            length_penalty=1.0,
+            early_stopping=True
+        )
+
+    return tokenizer.decode(
+        generated_ids[0],
+        skip_special_tokens=True
+    )
+
+# 16. Generate a summary for a dataset example
+example_text = df.iloc[0]["text"]
+reference_summary = df.iloc[0]["summary"]
+generated_summary = summarize(example_text)
+
+print("\n" + "=" * 60)
+print("SAMPLE RESULT")
+print("=" * 60)
+print("\nOriginal text:")
+print(example_text)
+print("\nReference summary:")
+print(reference_summary)
+print("\nGenerated summary:")
+print(generated_summary)
+
+# 17. Generate summaries for several examples
+NUMBER_OF_EXAMPLES = min(5, len(df))
+
+print("\n" + "=" * 60)
+print("MORE EXAMPLES")
+print("=" * 60)
+
+for i in range(NUMBER_OF_EXAMPLES):
+    generated = summarize(df.iloc[i]["text"])
+    print(f"\nExample {i + 1}")
+    print("Generated summary:", generated)
+    print("Reference summary:", df.iloc[i]["summary"])
+
+# 18. Save the fine-tuned model and tokenizer
+FINAL_MODEL_DIR = "/content/fine_tuned_t5_summarizer"
+trainer.save_model(FINAL_MODEL_DIR)
+tokenizer.save_pretrained(FINAL_MODEL_DIR)
+
+print("\nModel and tokenizer saved to:", FINAL_MODEL_DIR)
+
+# 19. Zip the model folder and download it
+import shutil
+
+zip_file = shutil.make_archive(
+    "/content/fine_tuned_t5_summarizer",
+    "zip",
+    FINAL_MODEL_DIR
+)
+
+print("Downloading saved model...")
+files.download(zip_file)
